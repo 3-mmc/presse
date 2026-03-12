@@ -46,7 +46,7 @@ lxml>=5.0
 ## Usage
 
 ```
-python digest.py URL [URL ...] [-o OUTPUT] [--no-pdf] [--engine ENGINE]
+python digest.py URL [-o OUTPUT] [--no-pdf] [--engine ENGINE]
 ```
 
 ### Basic example
@@ -67,32 +67,6 @@ Produces `digest.tex`, `digest.pdf`, and a `digest_images/` directory in the cur
 | `-o OUTPUT` | `digest` | Base name for output files (`.tex`, `.pdf`, `_images/`) |
 | `--no-pdf` | off | Write the `.tex` file but skip running the LaTeX engine |
 | `--engine ENGINE` | `xelatex` | LaTeX engine: `xelatex` or `pdflatex` |
-
-### Tone tags
-
-Append `[tone]` after any URL to override automatic tone detection:
-
-```sh
-python digest.py \
-  'https://lithub.com/some-essay [literary]' \
-  'https://arxiv.org/abs/1234 [academic]' \
-  'https://techcrunch.com/story [technical]'
-```
-
-Valid tones: `literary`, `journalistic`, `technical`, `academic`.
-
-Without a tag, tone is inferred by scoring the article title and source domain against four keyword lists. If no list wins clearly, `journalistic` is used as the default.
-
-## Tone → font mapping
-
-| Tone | Font (XeLaTeX) | Font (pdflatex) |
-|---|---|---|
-| `literary` | EB Garamond | ebgaramond |
-| `journalistic` | Linux Libertine O | libertine |
-| `technical` | XCharter | charter |
-| `academic` | TeX Gyre Pagella | mathpazo |
-
-The document title, table of contents, and all article title blocks always use Latin Modern regardless of tone. Only the article body text switches font.
 
 ## Output layout
 
