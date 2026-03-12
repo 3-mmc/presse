@@ -127,7 +127,6 @@ Each article page:
 
 ## Notes
 
-- **Source URLs are never included in the output.** The document contains no links back to the original articles.
 - **Duplicate images are skipped.** If the hero image URL also appears inline in the article body, it is not downloaded or embedded twice.
 - **Failed image downloads are silently skipped.** The document is produced regardless of whether individual images can be fetched.
 - **SVG images are skipped** (XeLaTeX/pdflatex cannot include them). WEBP, ICO, GIF, and BMP images are converted to PNG via Pillow if available; otherwise skipped.
