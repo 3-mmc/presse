@@ -1,3 +1,24 @@
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.venv/
+venv/
 .claude/
+
+# Generated digest output (digest.py writes these to cwd)
+*_images/
+*.pdf
+digest*.tex
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# Committed sample output lives under samples/
+!samples/
+!samples/**

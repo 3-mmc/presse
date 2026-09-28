@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""digest - Compile a list of URLs into a formatted LaTeX/PDF document."""
+"""digest - Compile a list of URLs into a formatted EPUB/PDF digest."""
 
 import argparse
+import email.utils
+import hashlib
 import io
 import json
 import math
@@ -11,6 +13,7 @@ import sys
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime
+from html import escape as _html_escape
 from pathlib import Path
 from typing import Optional
 from xml.etree import ElementTree as ET
@@ -22,14 +25,14 @@ from jinja2 import BaseLoader, Environment
 
 
 # ---------------------------------------------------------------------------
-# Tone detection
+# CLI URL arguments
 # ---------------------------------------------------------------------------
 
 def parse_url_arg(arg: str) -> str:
-    """Return the URL from a CLI argument, stripping any legacy [tone] tag."""
-    m = re.match(r'^(.+?)\s+\[\w+\]\s*$', arg.strip())
+    """Return the URL from a CLI argument, stripping any trailing [tag]."""
+    m = re.match(r"^(.+?)\s+\[(\w[\w-]*)\]\s*$", arg.strip())
     if m:
-        print("  [NOTE] Tone tags are no longer used; ignoring.", file=sys.stderr)
+        print("  [NOTE] [tags] are not supported; ignoring.", file=sys.stderr)
         return m.group(1).strip()
     return arg.strip()
 
@@ -42,6 +45,7 @@ def parse_url_arg(arg: str) -> str:
 class Article:
     title: str
     body_latex: str          # pre-rendered LaTeX (text + inline image commands)
+    body_html: str = ""      # XHTML fragment for EPUB chapters
     url: str = ""
     author_name: str = "Unknown"
     publication_name: str = ""
@@ -169,25 +173,87 @@ def _download_icon(url: str, dest: Path, timeout: int = 10) -> bool:
 # Per-article image set (deduplicates by normalized URL)
 # ---------------------------------------------------------------------------
 
+# Images smaller than this (in either dimension) are skipped: they are
+# almost always tracking pixels, lazy-load placeholders, or UI icons that
+# would otherwise surface as stray floating figures in the output.
+_MIN_IMAGE_DIM = 60
+
+
+def _file_hash(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _image_dimensions(path: str) -> tuple[int, int]:
+    """Return (width, height), or (0, 0) when the image cannot be read."""
+    if not path:
+        return (0, 0)
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            return img.size
+    except Exception:
+        return (0, 0)
+
+
 class ImageSet:
     """
     Manages content-image downloads for one article.
-    Deduplication key: URL with query string and fragment stripped.
+
+    Dedup works on two levels:
+    * by normalized URL (query/fragment stripped, scheme and www unified),
+      so resized/retargeted variants of the same file download once;
+    * by content hash, so visually identical images served from different
+      URLs share one file.
     """
 
     def __init__(self, img_dir: Path, prefix: str):
         self._img_dir = img_dir
         self._prefix = prefix
-        self._seen: dict[str, str] = {}   # norm_url -> local_path_or_""
+        self._seen: dict[str, str] = {}    # norm_url -> local_path_or_""
+        self._hashes: dict[str, str] = {}  # sha256 -> local_path
         self._count = 0
+        self.hero_path = ""                # set by preload(); body figures
+        self.emitted: set[str] = set()     # body-image paths already used
 
     @staticmethod
     def _norm(url: str) -> str:
-        """Normalize URL for dedup: drop query string and fragment."""
+        """Normalize URL for dedup: lowercase host, drop scheme, www,
+        query string, and fragment."""
         if not url:
             return ""
         p = urllib.parse.urlparse(url.strip())
-        return urllib.parse.urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
+        netloc = p.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return urllib.parse.urlunparse(("", netloc, p.path, "", "", ""))
+
+    def _register(self, norm: str, path: str) -> str:
+        """
+        Record a fresh download: drop files that are too small to be real
+        content, fold content-duplicates onto the first file kept.
+        Returns the path to use (possibly an earlier duplicate's).
+        """
+        if not path:
+            self._seen[norm] = ""
+            return ""
+        w, h = _image_dimensions(path)
+        if w < _MIN_IMAGE_DIM or h < _MIN_IMAGE_DIM:
+            Path(path).unlink(missing_ok=True)
+            self._seen[norm] = ""
+            return ""
+        digest = _file_hash(Path(path))
+        if digest in self._hashes and self._hashes[digest] != path:
+            Path(path).unlink(missing_ok=True)
+            path = self._hashes[digest]
+        else:
+            self._hashes.setdefault(digest, path)
+            self._count += 1
+        self._seen[norm] = path
+        return path
 
     def get(self, url: str) -> str:
         """
@@ -200,51 +266,172 @@ class ImageSet:
         if norm in self._seen:
             return self._seen[norm]
         dest_stem = self._img_dir / f"{self._prefix}_{self._count}"
-        self._count += 1
         path = _download_content_image(url, dest_stem)
-        self._seen[norm] = path
-        return path
+        return self._register(norm, path)
 
     def preload(self, url: str, dest_stem: Path) -> str:
         """
         Download *url* to a specific path stem (used for the hero image so
         it gets a predictable filename).  Registers the URL so that any
         subsequent get() call for the same URL returns this path instead of
-        downloading again.
+        downloading again, and records it as the hero path so the body
+        extractor can skip inline repeats of the hero image.
         """
         norm = self._norm(url)
         if not norm:
             return ""
         if norm in self._seen:
-            return self._seen[norm]
-        path = _download_content_image(url, dest_stem)
-        self._seen[norm] = path
+            path = self._seen[norm]
+        else:
+            # The hero file uses its own hero_<idx> stem, so it must not
+            # consume numbering from the art<idx>_<n> inline sequence.
+            saved_count = self._count
+            path = self._register(norm, _download_content_image(url, dest_stem))
+            self._count = saved_count
+        if path:
+            self.hero_path = path
         return path
+
+    def claim(self, path: str) -> bool:
+        """
+        Mark a body-image *path* as used.  Returns False when the path is
+        the hero image or was already emitted — i.e. the caller should skip
+        this figure instead of embedding a duplicate.
+        """
+        if not path or path == self.hero_path or path in self.emitted:
+            return False
+        self.emitted.add(path)
+        return True
 
 
 # ---------------------------------------------------------------------------
 # Metadata extraction
 # ---------------------------------------------------------------------------
 
-def _get_json_ld(soup: BeautifulSoup) -> dict:
+# Schema.org types that carry article metadata (lowercased for comparison).
+_ARTICLE_LD_TYPES = {
+    "article", "newsarticle", "blogposting", "blog", "liveblogposting",
+    "reportagenewsarticle", "analysisnewsarticle", "backgroundnewsarticle",
+    "opinionnewsarticle", "reviewnewsarticle", "investigativearticle",
+    "satiricalarticle", "scholarlyarticle", "medicalscholarlyarticle",
+    "socialmediaposting", "discussionforumposting",
+}
+
+
+def _iter_json_ld(soup: BeautifulSoup):
+    """
+    Yield every candidate metadata object from all ld+json blocks,
+    expanding top-level lists and @graph arrays.  Objects without any
+    type or content hints (bare @context wrappers, etc.) are skipped.
+    """
     for tag in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(tag.string or "")
-            if isinstance(data, list):
-                data = data[0]
-            if isinstance(data, dict):
-                return data
         except (json.JSONDecodeError, TypeError):
-            pass
-    return {}
+            continue
+        stack = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, list):
+                stack.extend(node)
+            elif isinstance(node, dict):
+                graph = node.get("@graph")
+                if isinstance(graph, list):
+                    stack.extend(graph)
+                if (
+                    "@type" in node
+                    or "headline" in node
+                    or "author" in node
+                    or "datePublished" in node
+                ):
+                    yield node
+
+
+def _pick_json_ld(soup: BeautifulSoup) -> dict:
+    """
+    Return the most article-like JSON-LD object: the first whose @type is
+    an article type, else the first candidate, else {}.
+    (Previously only the first script block was read, so pages listing a
+    WebSite or Organization block first lost all article metadata.)
+    """
+    first: dict = {}
+    for obj in _iter_json_ld(soup):
+        if not first:
+            first = obj
+        types = obj.get("@type", [])
+        if isinstance(types, str):
+            types = [types]
+        if any(str(t).split("/")[-1].lower() in _ARTICLE_LD_TYPES for t in types):
+            return obj
+    return first
+
+
+def _ld_str(obj: dict, *keys) -> str:
+    """First non-empty string value for *keys* (str, {name: ...}, or [first])."""
+    for k in keys:
+        v = obj.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        if isinstance(v, dict):
+            n = str(v.get("name", "")).strip()
+            if n:
+                return n
+        if isinstance(v, list) and v:
+            first = v[0]
+            if isinstance(first, str) and first.strip():
+                return first.strip()
+            if isinstance(first, dict):
+                n = str(first.get("name", "")).strip()
+                if n:
+                    return n
+    return ""
+
+
+def _ld_author(raw) -> tuple[str, str, str]:
+    """
+    Return (names, bio, avatar_url) from a JSON-LD author/creator value.
+    Multiple authors are joined with ", "; bio/avatar come from the first
+    entry that provides them.
+    """
+    items = raw if isinstance(raw, list) else [raw]
+    names: list[str] = []
+    bio = ""
+    avatar = ""
+    for it in items:
+        if isinstance(it, dict):
+            n = str(it.get("name", "")).strip()
+            if n:
+                names.append(n)
+            if not bio:
+                bio = str(it.get("description", "")).strip()
+            if not avatar:
+                im = it.get("image", "")
+                if isinstance(im, dict):
+                    im = im.get("url", "")
+                if isinstance(im, list) and im:
+                    im = im[0]
+                    if isinstance(im, dict):
+                        im = im.get("url", "")
+                if isinstance(im, str) and im.strip():
+                    avatar = im.strip()
+        elif isinstance(it, str) and it.strip():
+            names.append(it.strip())
+    return ", ".join(names), bio, avatar
+
+
+def _meta_values(soup: BeautifulSoup, *keys: str) -> str:
+    """First non-empty content of <meta name=...> or <meta property=...>."""
+    for k in keys:
+        tag = soup.find("meta", attrs={"name": k}) or soup.find("meta", property=k)
+        if tag and tag.get("content", "").strip():
+            return tag["content"].strip()
+    return ""
 
 
 def _og(soup: BeautifulSoup, prop: str) -> str:
-    tag = (
-        soup.find("meta", property=f"og:{prop}")
-        or soup.find("meta", attrs={"name": f"og:{prop}"})
-    )
-    return tag["content"].strip() if tag and tag.get("content") else ""
+    """Open Graph value, also accepting the unprefixed property/name form
+    (many sites emit property="article:published_time", not "og:...")."""
+    return _meta_values(soup, f"og:{prop}", prop)
 
 
 def _meta(soup: BeautifulSoup, name: str) -> str:
@@ -252,78 +439,170 @@ def _meta(soup: BeautifulSoup, name: str) -> str:
     return tag["content"].strip() if tag and tag.get("content") else ""
 
 
-def extract_metadata(url: str, soup: BeautifulSoup) -> dict:
-    ld = _get_json_ld(soup)
+def _strip_site_suffix(title: str, *site_names: str) -> str:
+    """
+    Remove a trailing " - SiteName" / " | SiteName" style suffix when it
+    matches a known site/publication name (case-insensitive).
+    """
+    for site in site_names:
+        site = (site or "").strip()
+        if not site or len(site) > len(title):
+            continue
+        for sep in (" - ", " | ", " – ", " — ", " :: ", ": ", " – ", " — "):
+            suffix = sep + site
+            if title.lower().endswith(suffix.lower()):
+                stem = title[: -len(suffix)].strip()
+                if stem:
+                    return stem
+    return title
 
-    def ld_str(*keys):
-        for k in keys:
-            v = ld.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-            if isinstance(v, dict):
-                n = v.get("name", "")
-                if n:
-                    return n.strip()
-            if isinstance(v, list) and v:
-                first = v[0]
-                if isinstance(first, str):
-                    return first.strip()
-                if isinstance(first, dict):
-                    n = first.get("name", "")
-                    if n:
-                        return n.strip()
+
+def _time_tag_date(soup: BeautifulSoup) -> str:
+    """datetime attribute of the first <time> element that has one."""
+    tag = soup.find("time", attrs={"datetime": True})
+    if tag and tag.get("datetime", "").strip():
+        return tag["datetime"].strip()
+    itemprop = soup.find(attrs={"itemprop": "datePublished"})
+    if itemprop is not None:
+        for attr in ("content", "datetime"):
+            if itemprop.get(attr, "").strip():
+                return itemprop.get(attr).strip()
+        if itemprop.get_text(strip=True):
+            return itemprop.get_text(strip=True)
+    return ""
+
+
+def _parse_date(raw: str) -> str:
+    """
+    Normalize a raw date string to "D Month YYYY".
+    Tries ISO 8601, RFC 2822, then a bare YYYY-MM-DD; returns the raw
+    string (trimmed) when nothing parses.
+    """
+    s = (raw or "").strip()
+    if not s:
         return ""
+    try:
+        return _fmt_date(datetime.fromisoformat(s.replace("Z", "+00:00")))
+    except ValueError:
+        pass
+    try:
+        return _fmt_date(email.utils.parsedate_to_datetime(s))
+    except (ValueError, TypeError):
+        pass
+    m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    if m:
+        try:
+            return _fmt_date(datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+        except ValueError:
+            pass
+    return s[:30]
 
+
+def _clean_author(name: str) -> str:
+    """Strip a leading "By " and collapse whitespace."""
+    name = re.sub(r"\s+", " ", (name or "").strip())
+    name = re.sub(r"^(by|von|par)\s+", "", name, flags=re.IGNORECASE)
+    return name.strip(" ,")
+
+
+def extract_metadata(
+    url: str,
+    soup: BeautifulSoup,
+    trafi: Optional[dict] = None,
+) -> dict:
+    """
+    Extract title/author/publication/date/hero-image metadata.
+    Layered fallbacks: JSON-LD → Open Graph/meta tags → <time>/itemprop →
+    trafilatura's own metadata (*trafi*) → <title>.
+    """
+    trafi = trafi or {}
+    ld = _pick_json_ld(soup)
+
+    site_name = _og(soup, "site_name")
+
+    pub_name = _ld_str(ld, "publisher", "isPartOf", "provider", "sourceOrganization")
+    if not pub_name:
+        pub_name = site_name or _meta(soup, "application-name")
+
+    title = None
+    ld_headline = _ld_str(ld, "headline")
+    ld_name = _ld_str(ld, "name")
+    og_title = _og(soup, "title")
+    if ld_name and og_title:
+        # Cross-check: some sites (e.g. Wikipedia) put a description in
+        # `headline` while `name` holds the real title.  When `name`
+        # matches the og:title (modulo site suffix), trust `name`.
+        og_stripped = _strip_site_suffix(og_title, pub_name, site_name).lower()
+        ld_name_l = ld_name.lower()
+        if (
+            og_stripped == ld_name_l
+            or og_stripped.startswith(ld_name_l + " ")
+            or ld_name_l.startswith(og_stripped + " ")
+        ):
+            title = ld_name
     title = (
-        ld_str("headline", "name")
-        or _og(soup, "title")
-        or (soup.title.string.strip() if soup.title else "Untitled")
+        title
+        or ld_headline
+        or ld_name
+        or og_title
+        or _meta_values(soup, "twitter:title")
+        or (trafi.get("title") or "").strip()
+        or (soup.title.string.strip() if soup.title and soup.title.string else "")
+        or "Untitled"
     )
+    title = _strip_site_suffix(title, pub_name, site_name)
 
-    author_name = ""
-    author_bio = ""
-    author_avatar_url = ""
-    author_raw = ld.get("author")
-    if isinstance(author_raw, list) and author_raw:
-        author_raw = author_raw[0]
-    if isinstance(author_raw, dict):
-        author_name = author_raw.get("name", "").strip()
-        author_bio = author_raw.get("description", "").strip()
-        author_avatar_url = author_raw.get("image", "")
-        if isinstance(author_avatar_url, dict):
-            author_avatar_url = author_avatar_url.get("url", "")
-    elif isinstance(author_raw, str):
-        author_name = author_raw.strip()
-
+    author_name, author_bio, author_avatar_url = _ld_author(
+        ld.get("author") or ld.get("creator") or ""
+    )
     if not author_name:
         author_name = (
             _meta(soup, "author")
-            or _og(soup, "article:author")
-            or "Unknown"
+            or _meta_values(
+                soup,
+                "article:author",
+                "twitter:creator",
+                "parsely-author",
+                "byl",
+                "dcterms.creator",
+                "DC.creator",
+            )
+            or (trafi.get("author") or "").strip()
         )
+        author_link = soup.find("a", rel="author")
+        if not author_name and author_link is not None:
+            author_name = author_link.get_text(strip=True)
+    author_name = _clean_author(author_name)
+    if not author_name:
+        author_name = "Unknown"
+    else:
+        author_name = _clean_author(author_name.lstrip("@"))
 
-    pub_name = ""
-    pub_raw = ld.get("publisher") or ld.get("isPartOf")
-    if isinstance(pub_raw, dict):
-        pub_name = pub_raw.get("name", "").strip()
-    if not pub_name:
-        pub_name = _og(soup, "site_name") or _meta(soup, "application-name") or ""
-
-    pub_date = (
-        ld_str("datePublished")
-        or _og(soup, "article:published_time")
-        or _meta(soup, "date")
-        or ""
+    pub_date = _parse_date(
+        _ld_str(ld, "datePublished")
+        or _meta_values(
+            soup,
+            "article:published_time",
+            "date",
+            "pubdate",
+            "publish-date",
+            "publish_date",
+            "publishdate",
+            "publication-date",
+            "publication_date",
+            "DC.date.issued",
+            "dcterms.created",
+            "dcterms.date",
+            "parsely-pub-date",
+            "datePublished",
+        )
+        or _time_tag_date(soup)
+        or (trafi.get("date") or "").strip()
+        or _ld_str(ld, "dateModified")
     )
-    if pub_date:
-        try:
-            dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
-            pub_date = _fmt_date(dt)
-        except (ValueError, AttributeError):
-            pub_date = pub_date[:10]
 
     # og:image — hero image for the article
-    og_image = _og(soup, "image")
+    og_image = _og(soup, "image") or _meta_values(soup, "twitter:image")
 
     return {
         "title": title,
@@ -517,13 +796,19 @@ def _inline_figure_latex(path: str, is_landscape: bool = False) -> str:
     )
 
 
-def _visit_xml_elem(
+def _collect_blocks(
     elem: ET.Element,
     img_set: ImageSet,
-    out: list[str],
+    blocks: list,
     word_count: list[int],
 ) -> None:
-    """Recursively convert a trafilatura XML element to LaTeX."""
+    """
+    Single traversal of a trafilatura XML element into format-neutral blocks.
+    Block tuples: ("para", text), ("head", text), ("items", [texts]),
+    ("quote", text), ("image", local_path, is_landscape).
+    Both the LaTeX and EPUB renderers consume these, so image dedup
+    (via ImageSet.claim) applies to both outputs.
+    """
     # Strip any namespace prefix (e.g. {http://...}p → p)
     tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
 
@@ -531,61 +816,105 @@ def _visit_xml_elem(
         text = "".join(elem.itertext()).strip()
         if text:
             word_count[0] += len(text.split())
-            out.append(tex(text))
-            out.append("")
+            blocks.append(("para", text))
 
     elif tag == "graphic":
         src = (elem.get("src") or "").strip()
         path = img_set.get(src)
-        if path:
-            is_landscape = not _get_image_is_portrait(path)
-            out.append(_inline_figure_latex(path, is_landscape))
-            out.append("")
-        # No fallback emitted — failed images are silently skipped
+        # claim() rejects the hero image, already-emitted repeats, and
+        # failed downloads — all of which previously surfaced as
+        # duplicate or stray figures in the output.
+        if path and img_set.claim(path):
+            blocks.append(("image", path, not _get_image_is_portrait(path)))
+        # No fallback emitted — failed/duplicate images are silently skipped
 
     elif tag == "head":
         text = "".join(elem.itertext()).strip()
         if text:
             word_count[0] += len(text.split())
-            out.append(r"\medskip\noindent{\bfseries " + tex(text) + r"}\par\smallskip")
-            out.append("")
+            blocks.append(("head", text))
 
     elif tag == "list":
-        items_tex = []
+        items = []
         for child in elem:
             child_tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
             if child_tag == "item":
                 text = "".join(child.itertext()).strip()
                 if text:
                     word_count[0] += len(text.split())
-                    items_tex.append(r"  \item " + tex(text))
-        if items_tex:
-            out.append(r"\begin{itemize}")
-            out.extend(items_tex)
-            out.append(r"\end{itemize}")
-            out.append("")
+                    items.append(text)
+        if items:
+            blocks.append(("items", items))
 
     elif tag == "quote":
         text = "".join(elem.itertext()).strip()
         if text:
             word_count[0] += len(text.split())
-            out.append(r"\begin{quote}")
-            out.append(tex(text))
-            out.append(r"\end{quote}")
-            out.append("")
+            blocks.append(("quote", text))
 
     else:
         # Unknown structural element: recurse into children
         for child in elem:
-            _visit_xml_elem(child, img_set, out, word_count)
+            _collect_blocks(child, img_set, blocks, word_count)
 
 
-def extract_body(html: str, img_set: ImageSet) -> tuple[str, int]:
+def _blocks_to_latex(blocks: list) -> str:
+    """Render collected blocks as LaTeX (paragraphs + inline figures)."""
+    out: list[str] = []
+    for block in blocks:
+        kind = block[0]
+        if kind == "para":
+            out.append(tex(block[1]))
+            out.append("")
+        elif kind == "head":
+            out.append(r"\medskip\noindent{\bfseries " + tex(block[1]) + r"}\par\smallskip")
+            out.append("")
+        elif kind == "items":
+            out.append(r"\begin{itemize}")
+            out.extend(r"  \item " + tex(t) for t in block[1])
+            out.append(r"\end{itemize}")
+            out.append("")
+        elif kind == "quote":
+            out.append(r"\begin{quote}")
+            out.append(tex(block[1]))
+            out.append(r"\end{quote}")
+            out.append("")
+        elif kind == "image":
+            _, path, is_landscape = block
+            out.append(_inline_figure_latex(path, is_landscape))
+            out.append("")
+    return "\n".join(out).strip()
+
+
+def _blocks_to_html(blocks: list) -> str:
     """
-    Extract article body as LaTeX, embedding inline images.
-    Tries trafilatura XML output first; falls back to plain text.
-    Returns (latex_str, word_count).
+    Render collected blocks as an XHTML fragment for EPUB chapters.
+    Image sources use the images/ basename form matching the EPUB manifest.
     """
+    out: list[str] = []
+    for block in blocks:
+        kind = block[0]
+        if kind == "para":
+            out.append(f"<p>{_html_escape(block[1])}</p>")
+        elif kind == "head":
+            out.append(f"<h2>{_html_escape(block[1])}</h2>")
+        elif kind == "items":
+            out.append("<ul>")
+            out.extend(f"<li>{_html_escape(t)}</li>" for t in block[1])
+            out.append("</ul>")
+        elif kind == "quote":
+            out.append(f"<blockquote><p>{_html_escape(block[1])}</p></blockquote>")
+        elif kind == "image":
+            _, path, _landscape = block
+            name = Path(path).name
+            out.append(
+                f'<div class="fig"><img src="images/{name}" alt=""/></div>'
+            )
+    return "\n".join(out)
+
+
+def _trafilatura_main(html: str) -> Optional[ET.Element]:
+    """Parse trafilatura XML output and return the <main> element, or None."""
     xml_str = trafilatura.extract(
         html,
         include_images=True,
@@ -593,27 +922,52 @@ def extract_body(html: str, img_set: ImageSet) -> tuple[str, int]:
         include_tables=False,
         output_format="xml",
     )
+    if not xml_str:
+        return None
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return None
+    main = root.find(".//main")
+    return main if main is not None else root
 
-    if xml_str:
-        try:
-            root = ET.fromstring(xml_str)
-            main = root.find(".//main") or root
-            out: list[str] = []
-            wc: list[int] = [0]
-            for child in main:
-                _visit_xml_elem(child, img_set, out, wc)
-            body = "\n".join(out).strip()
-            if body:
-                return body, wc[0]
-        except ET.ParseError:
-            pass
+
+def extract_bodies(html: str, img_set: ImageSet) -> tuple[str, str, int]:
+    """
+    Extract article body in both output forms.
+    Tries trafilatura XML output first; falls back to plain text.
+    Returns (latex_str, xhtml_fragment, word_count).
+    """
+    main = _trafilatura_main(html)
+    if main is not None:
+        blocks: list = []
+        wc: list[int] = [0]
+        for child in main:
+            _collect_blocks(child, img_set, blocks, wc)
+        latex = _blocks_to_latex(blocks)
+        if latex.strip():
+            return latex, _blocks_to_html(blocks), wc[0]
 
     # Fallback: plain text
     text = (
         trafilatura.extract(html, include_comments=False, include_tables=False)
         or ""
     )
-    return _plain_body_to_latex(text), len(text.split())
+    return (
+        _plain_body_to_latex(text),
+        _plain_body_to_html(text),
+        len(text.split()),
+    )
+
+
+def extract_body(html: str, img_set: ImageSet) -> tuple[str, int]:
+    """
+    Extract article body as LaTeX, embedding inline images.
+    Compatibility wrapper around extract_bodies.
+    Returns (latex_str, word_count).
+    """
+    latex, _xhtml, wc = extract_bodies(html, img_set)
+    return latex, wc
 
 
 def _plain_body_to_latex(text: str) -> str:
@@ -636,6 +990,26 @@ def _plain_body_to_latex(text: str) -> str:
             flush()
     flush()
     return "\n".join(out)
+
+
+def _plain_body_to_html(text: str) -> str:
+    """Convert plain extracted text to XHTML paragraphs (fallback path)."""
+    paras: list[str] = []
+    current: list[str] = []
+
+    def flush():
+        if current:
+            paras.append(f"<p>{_html_escape(' '.join(current))}</p>")
+            current.clear()
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            current.append(stripped)
+        else:
+            flush()
+    flush()
+    return "\n".join(paras)
 
 
 # ---------------------------------------------------------------------------
@@ -760,6 +1134,7 @@ LATEX_TEMPLATE = r"""
 \usepackage{xcolor}
 \usepackage{float}
 \usepackage{fancyhdr}
+\usepackage{placeins}  %% \FloatBarrier: keep floats inside their article
 
 \hypersetup{
   colorlinks=true,
@@ -914,6 +1289,8 @@ LATEX_TEMPLATE = r"""
 \markright{(( article.author_tex ))}%
 (( article.body_latex ))
 (% endif %)
+%% Flush pending floats so images cannot drift into the next article.
+\FloatBarrier
 %% End-of-article motif
 \digestmotif
 (% endfor %)
@@ -939,7 +1316,22 @@ def scrape(
             return None
 
         soup = BeautifulSoup(downloaded, "html.parser")
-        meta = extract_metadata(url, soup)
+
+        # Trafilatura's own document metadata (title/author/date) as a
+        # fallback layer inside extract_metadata.
+        trafi: dict = {}
+        try:
+            doc = trafilatura.bare_extraction(downloaded)
+            if doc is not None:
+                trafi = {
+                    "title": doc.title or "",
+                    "author": doc.author or "",
+                    "date": doc.date or "",
+                }
+        except Exception:
+            pass
+
+        meta = extract_metadata(url, soup, trafi)
 
         # Image set for this article — all content images share it for dedup
         img_set = ImageSet(img_dir, f"art{idx}")
@@ -969,11 +1361,11 @@ def scrape(
         if _download_icon(meta["favicon_url"], favicon_dest):
             favicon_path = favicon_dest.as_posix()
 
-        # Body: structured XML extraction with inline images
+        # Body: structured extraction with inline images (both outputs)
         print("    extracting body...", flush=True)
-        body_latex, word_count = extract_body(downloaded, img_set)
+        body_latex, body_html, word_count = extract_bodies(downloaded, img_set)
 
-        inline_count = img_set._count - (1 if hero_path else 0)
+        inline_count = len(img_set.emitted)
         if inline_count > 0:
             print(f"    embedded {inline_count} inline image(s)", flush=True)
 
@@ -984,6 +1376,7 @@ def scrape(
         return Article(
             title=meta["title"],
             body_latex=body_latex,
+            body_html=body_html,
             url=url,
             author_name=meta["author_name"],
             publication_name=meta["pub_name"],
@@ -1035,6 +1428,188 @@ def render_latex(articles: list[Article], today: str) -> str:
         })
 
     return tmpl.render(articles=article_ctx, date=today)
+
+
+# ---------------------------------------------------------------------------
+# EPUB rendering (ebooklib)
+#
+# Deliberately minimal styling: no font-family or fixed sizes, so each
+# e-reader's own typography settings apply.  Unlike the print PDF, chapters
+# link back to the original article URL (readers can follow links).
+# ---------------------------------------------------------------------------
+
+_EPUB_CSS = """\
+body {
+  margin: 0 4%;
+  text-align: justify;
+}
+h1, h2 {
+  text-align: left;
+  line-height: 1.25;
+}
+.byline {
+  color: #555;
+}
+.bio {
+  color: #555;
+  font-size: 0.9em;
+}
+.dateline {
+  color: #555;
+  font-size: 0.9em;
+}
+.source {
+  font-size: 0.9em;
+}
+.fig {
+  text-align: center;
+  margin: 1em 0;
+}
+img {
+  max-width: 100%;
+  height: auto;
+}
+blockquote {
+  margin-left: 1em;
+  padding-left: 1em;
+  border-left: 2px solid #999;
+  color: #333;
+}
+"""
+
+_EPUB_IMAGE_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+}
+
+
+def _chapter_image_names(article: Article) -> list[str]:
+    """Basenames of images used by a chapter, hero first, duplicates removed."""
+    names: list[str] = []
+    if article.hero_path:
+        names.append(Path(article.hero_path).name)
+    for m in re.finditer(r'src="images/([^"]+)"', article.body_html):
+        if m.group(1) not in names:
+            names.append(m.group(1))
+    return names
+
+
+def _chapter_html(article: Article) -> str:
+    """Full XHTML content for one article chapter."""
+    parts = [f"<h1>{_html_escape(article.title)}</h1>"]
+
+    byline = " — ".join(
+        p for p in (article.author_name, article.publication_name) if p
+    )
+    if byline:
+        parts.append(f'<p class="byline">{_html_escape(byline)}</p>')
+    if article.author_bio:
+        parts.append(f'<p class="bio">{_html_escape(article.author_bio[:200])}</p>')
+
+    meta_bits = [b for b in (article.published_date,) if b]
+    meta_bits.append(f"{article.reading_time} min read")
+    parts.append(f'<p class="dateline">{_html_escape(" · ".join(meta_bits))}</p>')
+
+    if article.url:
+        domain = urllib.parse.urlparse(article.url).netloc
+        parts.append(
+            f'<p class="source">Source: '
+            f'<a href="{_html_escape(article.url)}">'
+            f"{_html_escape(domain or article.url)}</a></p>"
+        )
+
+    if article.hero_path:
+        hero_name = Path(article.hero_path).name
+        parts.append(
+            f'<div class="fig hero">'
+            f'<img src="images/{hero_name}" alt=""/></div>'
+        )
+
+    parts.append(article.body_html)
+    return "\n".join(parts)
+
+
+def render_epub(
+    articles: list[Article],
+    today: str,
+    epub_path: Path,
+    img_dir: Path,
+) -> bool:
+    """
+    Write *epub_path* (one chapter per article, images embedded, cover from
+    the first available hero image).  Returns True on success.
+    """
+    try:
+        from ebooklib import epub
+    except ImportError:
+        print(
+            "  [ERROR] ebooklib is not installed "
+            "(pip install -r requirements.txt) — skipping EPUB.",
+            file=sys.stderr,
+        )
+        return False
+
+    book = epub.EpubBook()
+    book.set_identifier(f"digest-{today}")
+    book.set_title("Digest")
+    book.set_language("en")
+    for name in dict.fromkeys(
+        a.author_name for a in articles
+        if a.author_name and a.author_name != "Unknown"
+    ):
+        book.add_author(name)
+
+    css = epub.EpubItem(
+        uid="style",
+        file_name="style/style.css",
+        media_type="text/css",
+        content=_EPUB_CSS.encode("utf-8"),
+    )
+    book.add_item(css)
+
+    added_files: set[str] = set()
+    chapters = []
+    cover_set = False
+    for i, a in enumerate(articles):
+        ch = epub.EpubHtml(
+            title=a.title or f"Article {i + 1}",
+            file_name=f"article_{i}.xhtml",
+            lang="en",
+        )
+        ch.content = _chapter_html(a)
+        ch.add_item(css)
+        for img_name in _chapter_image_names(a):
+            arc_name = f"images/{img_name}"
+            if arc_name in added_files:
+                continue
+            local = img_dir / img_name
+            if not local.exists():
+                continue
+            if not cover_set and img_name == Path(a.hero_path or "").name:
+                book.set_cover(arc_name, local.read_bytes())
+                cover_set = True
+            else:
+                book.add_item(epub.EpubImage(
+                    uid=f"img_{i}_{len(added_files)}",
+                    file_name=arc_name,
+                    media_type=_EPUB_IMAGE_TYPES.get(
+                        local.suffix.lower(), "image/jpeg"
+                    ),
+                    content=local.read_bytes(),
+                ))
+            added_files.add(arc_name)
+        book.add_item(ch)
+        chapters.append(ch)
+
+    book.toc = tuple(chapters)
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    book.spine = (["cover", "nav"] if cover_set else ["nav"]) + chapters
+
+    epub.write_epub(str(epub_path), book)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1130,12 +1705,18 @@ def _confirm_articles(articles: list[Article]) -> list[Article]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compile a list of URLs into a formatted LaTeX/PDF digest.",
+        description="Compile a list of URLs into a formatted digest: "
+                    "an EPUB for e-readers by default, "
+                    "optionally a print-ready PDF via LaTeX.",
     )
     parser.add_argument("urls", nargs="+", metavar="URL", help="URLs to include")
     parser.add_argument(
         "-o", "--output", default="digest",
         help="Output base name (default: digest)",
+    )
+    parser.add_argument(
+        "--format", default="epub", choices=("pdf", "epub", "both"),
+        help="Output format(s) to produce (default: epub)",
     )
     parser.add_argument(
         "--no-pdf", action="store_true", help="Skip running the LaTeX engine"
@@ -1154,6 +1735,7 @@ def main():
     today = _fmt_date(datetime.today())
     output_base = Path(args.output).resolve()
     tex_path = output_base.with_suffix(".tex")
+    epub_path = output_base.with_suffix(".epub")
     img_dir = output_base.parent / (output_base.stem + "_images")
     img_dir.mkdir(exist_ok=True)
 
@@ -1172,28 +1754,34 @@ def main():
     if not args.yes and sys.stdin.isatty():
         articles = _confirm_articles(articles)
 
-    print(f"\nRendering LaTeX for {len(articles)} article(s)...")
-    latex_src = render_latex(articles, today)
-    tex_path.write_text(latex_src, encoding="utf-8")
-    print(f"  Written: {tex_path}")
+    if args.format in ("epub", "both"):
+        print(f"\nRendering EPUB for {len(articles)} article(s)...")
+        if render_epub(articles, today, epub_path, img_dir):
+            print(f"  Written: {epub_path}")
 
-    if not args.no_pdf:
-        engine = args.engine
-        print(f"\nRunning {engine} (pass 1)...")
-        _run_latex(tex_path, engine)
-        print(f"Running {engine} (pass 2, for TOC)...")
-        _run_latex(tex_path, engine)
-        pdf_path = output_base.with_suffix(".pdf")
-        if pdf_path.exists():
-            print(f"\nDone!  PDF: {pdf_path}")
+    if args.format in ("pdf", "both"):
+        print(f"\nRendering LaTeX for {len(articles)} article(s)...")
+        latex_src = render_latex(articles, today)
+        tex_path.write_text(latex_src, encoding="utf-8")
+        print(f"  Written: {tex_path}")
+
+        if not args.no_pdf:
+            engine = args.engine
+            print(f"\nRunning {engine} (pass 1)...")
+            _run_latex(tex_path, engine)
+            print(f"Running {engine} (pass 2, for TOC)...")
+            _run_latex(tex_path, engine)
+            pdf_path = output_base.with_suffix(".pdf")
+            if pdf_path.exists():
+                print(f"\nDone!  PDF: {pdf_path}")
+            else:
+                print(
+                    f"\n[WARN] {engine} did not produce a PDF — "
+                    "check the .log file for errors.",
+                    file=sys.stderr,
+                )
         else:
-            print(
-                "\n[WARN] pdflatex did not produce a PDF — "
-                "check the .log file for errors.",
-                file=sys.stderr,
-            )
-    else:
-        print("\nDone! (PDF compilation skipped)")
+            print("\nDone! (PDF compilation skipped)")
 
 
 if __name__ == "__main__":
